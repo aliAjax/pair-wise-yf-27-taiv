@@ -22,9 +22,10 @@ python3 -m unittest -v
 - `POST /api/objects`、`GET /api/objects`、`GET /api/objects/{id}`：藏品登记与分层查看。
 - `POST /api/objects/{id}/update`：更新藏品并创建完整快照。
 - `POST /api/sources`、`POST /api/objects/{id}/events`：来源与流转事件。
+- `POST /api/objects/{id}/events/{event_id}/source`：工作人员为已登记但缺少引用的流转补齐来源。
 - `POST /api/objects/{id}/evidence`：上传证据，服务端计算 SHA-256。
 - `POST /api/objects/{id}/claims`：提交权利主张。
 - `POST /api/claims/{id}/transition`：按 `submitted → under_review → negotiating → resolved_return/rejected` 流转。
 - `GET /api/objects/{id}/history` 与 `/history/{version}`：版本历史及历史快照。
 
-公众看不到持有人和内部事件；主张人只能查看自己的主张；阶段不能跳跃或从终态重新打开；每次对象变化都会保存 JSON 快照和审计记录。
+公众看不到持有人、来源、证据和内部事件；主张人只能查看自己的主张及核验是否通过，不能看到内部审查材料。审查员办理“进入协商”或“确认返还”时，系统会核对每段流转均有关联来源、藏品至少有一份证据；未通过时返回缺少的流转和证据，主张保持原阶段。工作人员补齐后可重新办理。藏品一旦完成返还，其历史、来源链、证据和主张均锁定；阶段不能跳跃或从终态重新打开，每次对象变化都会保存 JSON 快照和审计记录。

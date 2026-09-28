@@ -25,9 +25,9 @@ CLAIM_TRANSITIONS = {
 
 
 class BusinessError(Exception):
-    def __init__(self, message, status=400, code="bad_request"):
+    def __init__(self, message, status=400, code="bad_request", details=None):
         super().__init__(message)
-        self.message, self.status, self.code = message, status, code
+        self.message, self.status, self.code, self.details = message, status, code, details
 
 
 def now():
@@ -144,6 +144,47 @@ class ProvenanceStore:
             raise BusinessError("藏品不存在", 404, "not_found")
         return row
 
+    def _assert_not_returned(self, conn, object_id):
+        returned = conn.execute(
+            "SELECT 1 FROM claims WHERE object_id=? AND status='resolved_return' LIMIT 1",
+            (object_id,),
+        ).fetchone()
+        if returned:
+            raise BusinessError("返还已完成，藏品历史、来源链和主张均已锁定", 409, "return_locked")
+
+    def _provenance_status(self, conn, object_id, detailed):
+        missing_rows = conn.execute(
+            """SELECT id,event_type,date_start,date_end,place,description
+               FROM events WHERE object_id=? AND source_id IS NULL ORDER BY id""",
+            (object_id,),
+        ).fetchall()
+        evidence_count = conn.execute(
+            "SELECT COUNT(*) FROM evidence WHERE object_id=?", (object_id,)
+        ).fetchone()[0]
+        status = {"passed": not missing_rows and evidence_count > 0}
+        if detailed:
+            status.update(
+                {
+                    "missing_transfers": [dict(row) for row in missing_rows],
+                    "missing_evidence": evidence_count == 0,
+                    "evidence_count": evidence_count,
+                }
+            )
+        return status
+
+    def _assert_provenance_complete(self, conn, object_id):
+        status = self._provenance_status(conn, object_id, detailed=True)
+        if not status["passed"]:
+            raise BusinessError(
+                "来源链核验未通过，暂不能进入下一审查阶段",
+                409,
+                "provenance_incomplete",
+                details={
+                    "missing_transfers": status["missing_transfers"],
+                    "missing_evidence": status["missing_evidence"],
+                },
+            )
+
     def _audit(self, conn, object_id, actor, action, detail):
         conn.execute(
             "INSERT INTO audit_log(object_id,actor_id,action,detail,created_at) VALUES(?,?,?,?,?)",
@@ -189,6 +230,7 @@ class ProvenanceStore:
         with self.connect() as conn:
             actor = self._user(conn, user_id, {"staff"})
             row = self._object(conn, object_id)
+            self._assert_not_returned(conn, object_id)
             new_version = row["version"] + 1
             assignments = ",".join(f"{k}=?" for k in clean)
             conn.execute(
@@ -228,6 +270,7 @@ class ProvenanceStore:
         with self.connect() as conn:
             actor = self._user(conn, user_id, {"staff"})
             row = self._object(conn, object_id)
+            self._assert_not_returned(conn, object_id)
             if source_id and not conn.execute("SELECT 1 FROM sources WHERE id=?", (source_id,)).fetchone():
                 raise BusinessError("来源不存在", 404, "source_not_found")
             cur = conn.execute(
@@ -240,6 +283,26 @@ class ProvenanceStore:
             self._snapshot(conn, object_id, user_id)
             self._audit(conn, object_id, user_id, "event.add", {"event_id": cur.lastrowid, "version": new_version, "visibility": visibility})
             return {"id": cur.lastrowid, "object_id": object_id, "object_version": new_version}
+
+    def attach_event_source(self, user_id, object_id, event_id, source_id):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff"})
+            self._object(conn, object_id)
+            self._assert_not_returned(conn, object_id)
+            event = conn.execute("SELECT * FROM events WHERE id=? AND object_id=?", (event_id, object_id)).fetchone()
+            if not event:
+                raise BusinessError("流转事件不存在", 404, "event_not_found")
+            if event["source_id"]:
+                raise BusinessError("该流转事件已有关联来源引用", 409, "source_already_attached")
+            if not conn.execute("SELECT 1 FROM sources WHERE id=?", (source_id,)).fetchone():
+                raise BusinessError("来源不存在", 404, "source_not_found")
+            conn.execute("UPDATE events SET source_id=? WHERE id=?", (source_id, event_id))
+            obj = self._object(conn, object_id)
+            new_version = obj["version"] + 1
+            conn.execute("UPDATE objects SET version=?,updated_at=? WHERE id=?", (new_version, now(), object_id))
+            self._snapshot(conn, object_id, user_id)
+            self._audit(conn, object_id, user_id, "event.source.attach", {"event_id": event_id, "source_id": source_id, "version": new_version})
+            return {"event_id": event_id, "source_id": source_id, "object_version": new_version}
 
     def upload_evidence(self, user_id, object_id, filename, content_b64, visibility, event_id=None):
         if not filename.strip():
@@ -254,6 +317,7 @@ class ProvenanceStore:
         with self.connect() as conn:
             actor = self._user(conn, user_id, {"staff", "reviewer"})
             self._object(conn, object_id)
+            self._assert_not_returned(conn, object_id)
             if event_id and not conn.execute("SELECT 1 FROM events WHERE id=? AND object_id=?", (event_id, object_id)).fetchone():
                 raise BusinessError("证据关联的事件不存在", 404, "event_not_found")
             cur = conn.execute(
@@ -270,6 +334,7 @@ class ProvenanceStore:
         with self.connect() as conn:
             claimant = self._user(conn, user_id, {"claimant"})
             self._object(conn, object_id)
+            self._assert_not_returned(conn, object_id)
             cur = conn.execute(
                 """INSERT INTO claims(object_id,claimant_id,claimed_by,desired_outcome,created_at,updated_at)
                    VALUES(?,?,?,?,?,?)""",
@@ -291,6 +356,9 @@ class ProvenanceStore:
                 allowed = CLAIM_TRANSITIONS.get(claim["status"], set())
                 if new_status not in allowed:
                     raise BusinessError(f"不能从 {claim['status']} 直接变更为 {new_status}", 409, "invalid_transition")
+                self._assert_not_returned(conn, claim["object_id"])
+                if new_status in {"negotiating", "resolved_return"}:
+                    self._assert_provenance_complete(conn, claim["object_id"])
                 conn.execute("UPDATE claims SET status=?,updated_at=? WHERE id=?", (new_status, now(), claim_id))
                 conn.execute(
                     "INSERT INTO claim_reviews(claim_id,reviewer_id,old_status,new_status,note,created_at) VALUES(?,?,?,?,?,?)",
@@ -322,6 +390,7 @@ class ProvenanceStore:
                 return {
                     "id": obj["id"], "inventory_no": obj["inventory_no"], "title": obj["title"],
                     "object_type": obj["object_type"], "public_summary": obj["public_summary"], "version": obj["version"],
+                    "provenance_verification": self._provenance_status(conn, object_id, detailed=False),
                     "events": [dict(e) for e in events], "claims": [dict(c) for c in claims],
                 }
             result = {
@@ -334,14 +403,18 @@ class ProvenanceStore:
                 "claims": [dict(c) | {"reviews": [dict(r) for r in conn.execute("SELECT * FROM claim_reviews WHERE claim_id=? ORDER BY id", (c["id"],)).fetchall()]}
                            for c in conn.execute("SELECT * FROM claims WHERE object_id=? ORDER BY id", (object_id,)).fetchall()],
                 "unlinked_evidence": [dict(e) for e in conn.execute("SELECT id,filename,sha256,size,visibility FROM evidence WHERE object_id=? AND event_id IS NULL ORDER BY id", (object_id,)).fetchall()],
+                "provenance_verification": self._provenance_status(conn, object_id, detailed=True),
             }
             if user["role"] == "claimant":
-                # 主张人只看到公开来源事件和自己的主张，不能浏览内部调查材料。
-                result["events"] = [e for e in result["events"] if e["visibility"] == "public"]
+                # 主张人只看到公开流转事件和自己的主张，不能浏览内部来源、证据或审查材料。
+                public_fields = ("id", "event_type", "date_start", "date_end", "place", "description", "visibility", "created_at")
+                result["events"] = [{k: e[k] for k in public_fields if k in e}
+                                    for e in result["events"] if e["visibility"] == "public"]
                 result["unlinked_evidence"] = []
-                result["claims"] = [c for c in result["claims"] if c["claimant_id"] == user_id]
-                for c in result["claims"]:
-                    c.pop("claimant_id", None)
+                result["provenance_verification"] = {"passed": result["provenance_verification"]["passed"]}
+                claim_fields = ("id", "claimed_by", "desired_outcome", "status", "created_at")
+                result["claims"] = [{k: c[k] for k in claim_fields}
+                                    for c in result["claims"] if c["claimant_id"] == user_id]
             return result
 
     def list_objects(self, user_id):
@@ -418,6 +491,11 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[3] == "update" and method == "POST": return self._send(200, store.update_object(user, object_id, self._body().get("changes", {})))
             if len(parts) == 4 and parts[3] == "events" and method == "POST":
                 d = self._body(); return self._send(201, store.add_event(user, object_id, d.get("event_type", ""), d.get("date_start", ""), d.get("date_end", ""), d.get("place", ""), d.get("description", ""), d.get("source_id"), d.get("visibility", "internal")))
+            if len(parts) == 6 and parts[3] == "events" and parts[5] == "source" and method == "POST":
+                d = self._body()
+                if not isinstance(d.get("source_id"), int):
+                    raise BusinessError("source_id 必须是整数", 422, "invalid_source")
+                return self._send(200, store.attach_event_source(user, object_id, int(parts[4]), d["source_id"]))
             if len(parts) == 4 and parts[3] == "evidence" and method == "POST":
                 d = self._body(); return self._send(201, store.upload_evidence(user, object_id, d.get("filename", ""), d.get("content_b64", ""), d.get("visibility", "internal"), d.get("event_id")))
             if len(parts) == 4 and parts[3] == "claims" and method == "POST":
@@ -430,7 +508,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle(self, method):
         try: self._dispatch(method)
-        except BusinessError as exc: self._send(exc.status, {"error": {"code": exc.code, "message": exc.message}})
+        except BusinessError as exc:
+            error = {"code": exc.code, "message": exc.message}
+            if exc.details is not None:
+                error["details"] = exc.details
+            self._send(exc.status, {"error": error})
         except (ValueError, TypeError): self._send(400, {"error": {"code": "invalid_path", "message": "路径参数格式错误"}})
         except Exception as exc: self._send(500, {"error": {"code": "internal_error", "message": str(exc)}})
 
