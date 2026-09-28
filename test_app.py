@@ -46,6 +46,61 @@ class ProvenanceTests(unittest.TestCase):
             self.store.add_event("public", obj["id"], "note", "2020-01-01", "", "馆内", "未授权事件", None, "public")
         self.assertEqual(ctx.exception.status, 403)
 
+    def test_provenance_gate_can_be_completed_and_locks_returned_object(self):
+        source = self.store.add_source("staff", "家族移交记录", "archive", "FAM-1974-3")
+        obj = self.store.create_object("staff", "M-1974-3", "信函", "纸质", "市档案馆", "来源链待补。")
+        event = self.store.add_event("staff", obj["id"], "transfer", "1974-05-01", "", "本市", "家族移交至馆方", None, "public")
+        claim = self.store.create_claim("claimant1", obj["id"], "李氏后人", "返还原物")
+        self.store.transition_claim("reviewer1", claim["id"], "under_review", "受理主张并核验来源。")
+
+        with self.assertRaises(BusinessError) as ctx:
+            self.store.transition_claim("reviewer1", claim["id"], "negotiating", "拟进入协商。")
+        self.assertEqual(ctx.exception.status, 422)
+        self.assertEqual(ctx.exception.code, "provenance_check_failed")
+        missing_types = {item["type"] for item in ctx.exception.details["missing_items"]}
+        self.assertEqual(missing_types, {"source_reference", "evidence"})
+        self.assertEqual(ctx.exception.details["missing_items"][0]["events"][0]["event_id"], event["id"])
+
+        self.store.attach_event_source("staff", obj["id"], event["id"], source["id"])
+        self.store.upload_evidence(
+            "staff", obj["id"], "family-letter.pdf",
+            base64.b64encode(b"family transfer record").decode(),
+            "internal", event["id"],
+        )
+        self.store.transition_claim("reviewer1", claim["id"], "negotiating", "来源链补齐，进入协商。")
+        self.store.transition_claim("reviewer1", claim["id"], "resolved_return", "核验通过，确认返还。")
+
+        internal_view = self.store.get_object("reviewer1", obj["id"])
+        self.assertTrue(internal_view["provenance_check"]["passed"])
+        self.assertEqual(internal_view["provenance_check"]["evidence_count"], 1)
+        public_view = self.store.get_object("public", obj["id"])
+        claimant_view = self.store.get_object("claimant1", obj["id"])
+        self.assertTrue(public_view["provenance_verified"])
+        self.assertTrue(claimant_view["provenance_verified"])
+        self.assertNotIn("provenance_check", public_view)
+        self.assertNotIn("provenance_check", claimant_view)
+        self.assertNotIn("current_holder", claimant_view)
+        self.assertNotIn("unlinked_evidence", claimant_view)
+        self.assertNotIn("reviews", claimant_view["claims"][0])
+        self.assertNotIn("source", claimant_view["events"][0])
+
+        locked_calls = [
+            lambda: self.store.update_object("staff", obj["id"], {"public_summary": "尝试修改"}),
+            lambda: self.store.add_event("staff", obj["id"], "note", "2026-01-01", "", "馆内", "返还后新增流转", source["id"], "internal"),
+            lambda: self.store.attach_event_source("staff", obj["id"], event["id"], source["id"]),
+            lambda: self.store.upload_evidence("staff", obj["id"], "after.pdf", base64.b64encode(b"x").decode(), "internal"),
+            lambda: self.store.create_claim("claimant1", obj["id"], "其他后人", "再次主张"),
+        ]
+        for call in locked_calls:
+            with self.assertRaises(BusinessError) as ctx:
+                call()
+            self.assertEqual(ctx.exception.code, "return_locked")
+
+        history = self.store.object_history("reviewer1", obj["id"])
+        final_snapshot = self.store.history_detail("reviewer1", obj["id"], history[-1]["version"])
+        self.assertEqual(final_snapshot["snapshot"]["claims"][0]["status"], "resolved_return")
+        self.assertEqual(len(final_snapshot["snapshot"]["evidence"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -25,9 +25,9 @@ CLAIM_TRANSITIONS = {
 
 
 class BusinessError(Exception):
-    def __init__(self, message, status=400, code="bad_request"):
+    def __init__(self, message, status=400, code="bad_request", details=None):
         super().__init__(message)
-        self.message, self.status, self.code = message, status, code
+        self.message, self.status, self.code, self.details = message, status, code, details
 
 
 def now():
@@ -155,12 +155,59 @@ class ProvenanceStore:
         snapshot = {
             "object": dict(row),
             "events": [dict(x) for x in conn.execute("SELECT * FROM events WHERE object_id=? ORDER BY id", (object_id,)).fetchall()],
+            "evidence": [dict(x) for x in conn.execute(
+                "SELECT id,object_id,event_id,filename,sha256,size,visibility,uploaded_by,created_at FROM evidence WHERE object_id=? ORDER BY id",
+                (object_id,),
+            ).fetchall()],
             "claims": [dict(x) for x in conn.execute("SELECT * FROM claims WHERE object_id=? ORDER BY id", (object_id,)).fetchall()],
         }
         conn.execute(
             "INSERT INTO object_versions(object_id,version,snapshot,changed_by,created_at) VALUES(?,?,?,?,?)",
             (object_id, row["version"], json.dumps(snapshot, ensure_ascii=False, sort_keys=True), actor, now()),
         )
+
+    def _assert_not_returned(self, conn, object_id):
+        completed = conn.execute(
+            "SELECT 1 FROM claims WHERE object_id=? AND status='resolved_return' LIMIT 1",
+            (object_id,),
+        ).fetchone()
+        if completed:
+            raise BusinessError("返还已完成，藏品历史、来源链和主张均已锁定", 409, "return_locked")
+
+    def _provenance_check(self, conn, object_id):
+        events = conn.execute(
+            """SELECT e.id,e.event_type,e.date_start,e.place,e.description,e.source_id
+               FROM events e WHERE e.object_id=? ORDER BY e.id""",
+            (object_id,),
+        ).fetchall()
+        missing_source_events = [
+            {
+                "event_id": event["id"],
+                "event_type": event["event_type"],
+                "date_start": event["date_start"],
+                "place": event["place"],
+                "description": event["description"],
+            }
+            for event in events
+            if event["source_id"] is None
+        ]
+        evidence_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM evidence WHERE object_id=?",
+            (object_id,),
+        ).fetchone()["count"]
+        missing_items = []
+        if not events:
+            missing_items.append({"type": "provenance_event", "message": "缺少来源链流转记录"})
+        if missing_source_events:
+            missing_items.append({"type": "source_reference", "events": missing_source_events})
+        if evidence_count < 1:
+            missing_items.append({"type": "evidence", "message": "藏品至少需要一份关联证据"})
+        return {
+            "passed": not missing_items,
+            "missing_items": missing_items,
+            "event_count": len(events),
+            "evidence_count": evidence_count,
+        }
 
     def create_object(self, user_id, inventory_no, title, object_type, holder, public_summary):
         inventory_no, title = inventory_no.strip(), title.strip()
@@ -189,6 +236,7 @@ class ProvenanceStore:
         with self.connect() as conn:
             actor = self._user(conn, user_id, {"staff"})
             row = self._object(conn, object_id)
+            self._assert_not_returned(conn, object_id)
             new_version = row["version"] + 1
             assignments = ",".join(f"{k}=?" for k in clean)
             conn.execute(
@@ -228,6 +276,7 @@ class ProvenanceStore:
         with self.connect() as conn:
             actor = self._user(conn, user_id, {"staff"})
             row = self._object(conn, object_id)
+            self._assert_not_returned(conn, object_id)
             if source_id and not conn.execute("SELECT 1 FROM sources WHERE id=?", (source_id,)).fetchone():
                 raise BusinessError("来源不存在", 404, "source_not_found")
             cur = conn.execute(
@@ -240,6 +289,35 @@ class ProvenanceStore:
             self._snapshot(conn, object_id, user_id)
             self._audit(conn, object_id, user_id, "event.add", {"event_id": cur.lastrowid, "version": new_version, "visibility": visibility})
             return {"id": cur.lastrowid, "object_id": object_id, "object_version": new_version}
+
+    def attach_event_source(self, user_id, object_id, event_id, source_id):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"staff"})
+            obj = self._object(conn, object_id)
+            self._assert_not_returned(conn, object_id)
+            event = conn.execute("SELECT * FROM events WHERE id=? AND object_id=?", (event_id, object_id)).fetchone()
+            if not event:
+                raise BusinessError("流转事件不存在", 404, "event_not_found")
+            if event["source_id"] is not None:
+                raise BusinessError("该流转已有来源引用", 409, "source_already_attached")
+            source = conn.execute("SELECT id,name,reference FROM sources WHERE id=?", (source_id,)).fetchone()
+            if not source:
+                raise BusinessError("来源不存在", 404, "source_not_found")
+            conn.execute("UPDATE events SET source_id=? WHERE id=?", (source_id, event_id))
+            new_version = obj["version"] + 1
+            conn.execute("UPDATE objects SET version=?,updated_at=? WHERE id=?", (new_version, now(), object_id))
+            self._snapshot(conn, object_id, user_id)
+            self._audit(conn, object_id, user_id, "event.source.attach", {
+                "event_id": event_id,
+                "source_id": source_id,
+                "version": new_version,
+            })
+            return {
+                "event_id": event_id,
+                "source_id": source_id,
+                "source": dict(source),
+                "object_version": new_version,
+            }
 
     def upload_evidence(self, user_id, object_id, filename, content_b64, visibility, event_id=None):
         if not filename.strip():
@@ -254,6 +332,7 @@ class ProvenanceStore:
         with self.connect() as conn:
             actor = self._user(conn, user_id, {"staff", "reviewer"})
             self._object(conn, object_id)
+            self._assert_not_returned(conn, object_id)
             if event_id and not conn.execute("SELECT 1 FROM events WHERE id=? AND object_id=?", (event_id, object_id)).fetchone():
                 raise BusinessError("证据关联的事件不存在", 404, "event_not_found")
             cur = conn.execute(
@@ -270,6 +349,7 @@ class ProvenanceStore:
         with self.connect() as conn:
             claimant = self._user(conn, user_id, {"claimant"})
             self._object(conn, object_id)
+            self._assert_not_returned(conn, object_id)
             cur = conn.execute(
                 """INSERT INTO claims(object_id,claimant_id,claimed_by,desired_outcome,created_at,updated_at)
                    VALUES(?,?,?,?,?,?)""",
@@ -291,6 +371,15 @@ class ProvenanceStore:
                 allowed = CLAIM_TRANSITIONS.get(claim["status"], set())
                 if new_status not in allowed:
                     raise BusinessError(f"不能从 {claim['status']} 直接变更为 {new_status}", 409, "invalid_transition")
+                if new_status in {"negotiating", "resolved_return"}:
+                    provenance = self._provenance_check(conn, claim["object_id"])
+                    if not provenance["passed"]:
+                        raise BusinessError(
+                            "来源链核验未通过，不能推进该主张",
+                            422,
+                            "provenance_check_failed",
+                            provenance,
+                        )
                 conn.execute("UPDATE claims SET status=?,updated_at=? WHERE id=?", (new_status, now(), claim_id))
                 conn.execute(
                     "INSERT INTO claim_reviews(claim_id,reviewer_id,old_status,new_status,note,created_at) VALUES(?,?,?,?,?,?)",
@@ -319,29 +408,56 @@ class ProvenanceStore:
                 claims = conn.execute(
                     "SELECT id,claimed_by,desired_outcome,status,created_at FROM claims WHERE object_id=? ORDER BY id", (object_id,)
                 ).fetchall()
+                provenance = self._provenance_check(conn, object_id)
                 return {
                     "id": obj["id"], "inventory_no": obj["inventory_no"], "title": obj["title"],
                     "object_type": obj["object_type"], "public_summary": obj["public_summary"], "version": obj["version"],
                     "events": [dict(e) for e in events], "claims": [dict(c) for c in claims],
+                    "provenance_verified": provenance["passed"],
                 }
             result = {
                 "id": obj["id"], "inventory_no": obj["inventory_no"], "title": obj["title"],
                 "object_type": obj["object_type"], "current_holder": obj["current_holder"],
                 "public_summary": obj["public_summary"], "version": obj["version"],
                 "events": [dict(x) | {"source": dict(conn.execute("SELECT id,name,source_type,reference FROM sources WHERE id=?", (x["source_id"],)).fetchone()) if x["source_id"] else None,
-                                     "evidence": [dict(e) for e in conn.execute("SELECT id,filename,sha256,size,visibility FROM evidence WHERE event_id=? ORDER BY id", (x["id"],)).fetchall()]}
+                                     "evidence": [dict(e) for e in conn.execute("SELECT id,event_id,filename,sha256,size,visibility,uploaded_by,created_at FROM evidence WHERE event_id=? ORDER BY id", (x["id"],)).fetchall()]}
                             for x in conn.execute("SELECT * FROM events WHERE object_id=? ORDER BY id", (object_id,)).fetchall()],
                 "claims": [dict(c) | {"reviews": [dict(r) for r in conn.execute("SELECT * FROM claim_reviews WHERE claim_id=? ORDER BY id", (c["id"],)).fetchall()]}
                            for c in conn.execute("SELECT * FROM claims WHERE object_id=? ORDER BY id", (object_id,)).fetchall()],
-                "unlinked_evidence": [dict(e) for e in conn.execute("SELECT id,filename,sha256,size,visibility FROM evidence WHERE object_id=? AND event_id IS NULL ORDER BY id", (object_id,)).fetchall()],
+                "unlinked_evidence": [dict(e) for e in conn.execute("SELECT id,filename,sha256,size,visibility,uploaded_by,created_at FROM evidence WHERE object_id=? AND event_id IS NULL ORDER BY id", (object_id,)).fetchall()],
+                "provenance_check": self._provenance_check(conn, object_id),
             }
             if user["role"] == "claimant":
-                # 主张人只看到公开来源事件和自己的主张，不能浏览内部调查材料。
-                result["events"] = [e for e in result["events"] if e["visibility"] == "public"]
-                result["unlinked_evidence"] = []
-                result["claims"] = [c for c in result["claims"] if c["claimant_id"] == user_id]
-                for c in result["claims"]:
-                    c.pop("claimant_id", None)
+                # 主张人只看到公开事件和自己的主张；来源链仅返回是否通过，不暴露内部材料。
+                provenance = result.pop("provenance_check")
+                result["events"] = [
+                    {
+                        "id": e["id"],
+                        "event_type": e["event_type"],
+                        "date_start": e["date_start"],
+                        "date_end": e["date_end"],
+                        "place": e["place"],
+                        "description": e["description"],
+                        "visibility": e["visibility"],
+                        "created_at": e["created_at"],
+                    }
+                    for e in result["events"]
+                    if e["visibility"] == "public"
+                ]
+                result.pop("current_holder", None)
+                result.pop("unlinked_evidence", None)
+                result["claims"] = [
+                    {
+                        "id": c["id"],
+                        "claimed_by": c["claimed_by"],
+                        "desired_outcome": c["desired_outcome"],
+                        "status": c["status"],
+                        "created_at": c["created_at"],
+                    }
+                    for c in result["claims"]
+                    if c["claimant_id"] == user_id
+                ]
+                result["provenance_verified"] = provenance["passed"]
             return result
 
     def list_objects(self, user_id):
@@ -418,6 +534,8 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[3] == "update" and method == "POST": return self._send(200, store.update_object(user, object_id, self._body().get("changes", {})))
             if len(parts) == 4 and parts[3] == "events" and method == "POST":
                 d = self._body(); return self._send(201, store.add_event(user, object_id, d.get("event_type", ""), d.get("date_start", ""), d.get("date_end", ""), d.get("place", ""), d.get("description", ""), d.get("source_id"), d.get("visibility", "internal")))
+            if len(parts) == 6 and parts[3] == "events" and parts[5] == "source" and method == "POST":
+                d = self._body(); return self._send(200, store.attach_event_source(user, object_id, int(parts[4]), d.get("source_id")))
             if len(parts) == 4 and parts[3] == "evidence" and method == "POST":
                 d = self._body(); return self._send(201, store.upload_evidence(user, object_id, d.get("filename", ""), d.get("content_b64", ""), d.get("visibility", "internal"), d.get("event_id")))
             if len(parts) == 4 and parts[3] == "claims" and method == "POST":
@@ -430,7 +548,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle(self, method):
         try: self._dispatch(method)
-        except BusinessError as exc: self._send(exc.status, {"error": {"code": exc.code, "message": exc.message}})
+        except BusinessError as exc:
+            error = {"code": exc.code, "message": exc.message}
+            if exc.details is not None:
+                error["details"] = exc.details
+            self._send(exc.status, {"error": error})
         except (ValueError, TypeError): self._send(400, {"error": {"code": "invalid_path", "message": "路径参数格式错误"}})
         except Exception as exc: self._send(500, {"error": {"code": "internal_error", "message": str(exc)}})
 
